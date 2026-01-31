@@ -11,7 +11,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import shutil
 
@@ -45,6 +45,7 @@ class Config:
     sbert_device: str
     sbert_batch_size: int
     sbert_max_length: int
+    use_video_input: bool
 
 
 def parse_args() -> Config:
@@ -76,6 +77,8 @@ def parse_args() -> Config:
     parser.add_argument("--sbert-device", type=str, default="cpu")
     parser.add_argument("--sbert-batch-size", type=int, default=8)
     parser.add_argument("--sbert-max-length", type=int, default=0)
+    parser.add_argument("--use-video-input", action="store_true", default=False)
+    parser.add_argument("--no-use-video-input", action="store_false", dest="use_video_input")
     args = parser.parse_args()
     return Config(
         input_dir=args.input_dir,
@@ -99,6 +102,7 @@ def parse_args() -> Config:
         sbert_device=args.sbert_device,
         sbert_batch_size=args.sbert_batch_size,
         sbert_max_length=args.sbert_max_length,
+        use_video_input=args.use_video_input,
     )
 
 
@@ -207,11 +211,26 @@ def encode_image_base64(image_path: Path) -> str:
     return f"data:image/jpeg;base64,{encoded}"
 
 
+def encode_video_base64(video_path: Path) -> str:
+    """動画をbase64に変換する.
+
+    Args:
+        video_path: 動画パス.
+
+    Returns:
+        str: data URL.
+    """
+    data = video_path.read_bytes()
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:video/mp4;base64,{encoded}"
+
+
 def call_vllm_chat(
     vllm_url: str,
     model: str,
     prompt_text: str,
     image_data_urls: Iterable[str],
+    video_data_url: Optional[str] = None,
     timeout_sec: int = 60,
 ) -> str:
     """vLLM OpenAI互換APIを呼び出す.
@@ -220,7 +239,8 @@ def call_vllm_chat(
         vllm_url: ベースURL.
         model: モデル名.
         prompt_text: 指示文.
-        image_paths: 画像パス.
+        image_data_urls: 画像data URL.
+        video_data_url: 動画data URL.
         timeout_sec: タイムアウト.
 
     Returns:
@@ -230,13 +250,21 @@ def call_vllm_chat(
         RuntimeError: 応答が不正な場合.
     """
     content = [{"type": "text", "text": prompt_text}]
-    for data_url in image_data_urls:
+    if video_data_url:
         content.append(
             {
-                "type": "image_url",
-                "image_url": {"url": data_url},
+                "type": "video_url",
+                "video_url": {"url": video_data_url},
             }
         )
+    else:
+        for data_url in image_data_urls:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url},
+                }
+            )
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
@@ -473,10 +501,11 @@ def main() -> None:
     if config.debug:
         print("デバッグモード: 有効")
     ffmpeg_missing = shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None
-    if ffmpeg_missing and not config.allow_missing_ffmpeg:
-        raise RuntimeError("ffmpeg/ffprobe が見つかりません")
-    if ffmpeg_missing and config.allow_missing_ffmpeg:
-        print("警告: ffmpeg/ffprobe が見つかりません。ダミー画像で続行します。")
+    if not config.use_video_input:
+        if ffmpeg_missing and not config.allow_missing_ffmpeg:
+            raise RuntimeError("ffmpeg/ffprobe が見つかりません")
+        if ffmpeg_missing and config.allow_missing_ffmpeg:
+            print("警告: ffmpeg/ffprobe が見つかりません。ダミー画像で続行します。")
     if not config.train_csv.exists():
         raise RuntimeError("学習CSVが見つかりません")
     prompts = load_train_prompts(config.train_csv)
@@ -511,17 +540,28 @@ def main() -> None:
     captions = {}
     def process_video(video_path: Path) -> dict:
         start_time = time.time()
-        if ffmpeg_missing:
-            frames = [dummy_image_data_url()]
+        if config.use_video_input:
+            video_url = encode_video_base64(video_path)
+            caption = call_vllm_chat(
+                config.vllm_url,
+                config.model,
+                prompt_text,
+                [],
+                video_data_url=video_url,
+                timeout_sec=config.request_timeout,
+            )
         else:
-            frames = extract_frames(video_path, config.max_frames)
-        caption = call_vllm_chat(
-            config.vllm_url,
-            config.model,
-            prompt_text,
-            frames,
-            timeout_sec=config.request_timeout,
-        )
+            if ffmpeg_missing:
+                frames = [dummy_image_data_url()]
+            else:
+                frames = extract_frames(video_path, config.max_frames)
+            caption = call_vllm_chat(
+                config.vllm_url,
+                config.model,
+                prompt_text,
+                frames,
+                timeout_sec=config.request_timeout,
+            )
         return {
             "video_id": int(video_path.stem),
             "caption": caption,

@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -54,6 +55,15 @@ class Config:
     video_payload_mode: str
     video_fallback_to_frames: bool
     frame_size: str
+
+
+@dataclass
+class StyleGuidance:
+    """スタイル指針."""
+
+    sentence_target: int
+    use_semicolon: bool
+    motion_words: List[str]
 
 
 def parse_args() -> Config:
@@ -422,7 +432,11 @@ def call_vllm_chat(
 
 
 def build_style_prompt(
-    train_prompts: List[str], samples: int, seed: int, token_limit: int
+    train_prompts: List[str],
+    samples: int,
+    seed: int,
+    token_limit: int,
+    guidance: StyleGuidance,
 ) -> str:
     """学習プロンプトのスタイルに寄せた指示文を作る.
 
@@ -436,19 +450,86 @@ def build_style_prompt(
     """
     if not train_prompts:
         return "Describe the video briefly with the main subject, action, and setting."
+    cleaned_prompts = [normalize_prompt_text(p) for p in train_prompts]
+    cleaned_prompts = [p for p in cleaned_prompts if p]
     rng = np.random.default_rng(seed)
-    count = min(samples, len(train_prompts))
-    indices = rng.choice(len(train_prompts), size=count, replace=False)
-    examples = "\n".join(f"- {train_prompts[i]}" for i in indices)
+    count = min(samples, len(cleaned_prompts))
+    indices = rng.choice(len(cleaned_prompts), size=count, replace=False)
+    examples = "\n".join(f"- {cleaned_prompts[i]}" for i in indices)
     limit_text = ""
     if token_limit > 0:
         limit_text = f" Limit to {token_limit} tokens or fewer."
+    motion_hint = ""
+    if guidance.motion_words:
+        motion_hint = " Use words like " + ", ".join(guidance.motion_words) + "."
+    semicolon_hint = ""
+    if guidance.use_semicolon:
+        semicolon_hint = " Semicolons are common."
     return (
         "You are given a short video. Write one English prompt in the same style as the examples. "
-        "Include main subject(s), action, setting, and motion. If visible, add camera framing, lens, "
-        "camera movement, lighting, atmosphere, and texture/material. Mention temporal behavior (e.g., "
-        "looping, drifting, repeating, continuous) when applicable. Use a single sentence without quotes, "
-        f"tags, or bullet points.{limit_text}\nExamples:\n{examples}\nNow write the prompt for the video."
+        f"Write {guidance.sentence_target} sentences.{semicolon_hint} "
+        "Sentence 1: main subject, scene, and action. "
+        "Sentence 2: sensory details (light, texture, air, micro-motions). "
+        "Sentence 3: explicitly describe continuous or repeating motion."
+        " Keep a calm, gentle tone and focus on one subject and one scene."
+        " If visible, add camera framing, lens, movement, lighting, and atmosphere."
+        f"{motion_hint} Avoid quotes, tags, or bullet points.{limit_text}\n"
+        f"Examples:\n{examples}\nNow write the prompt for the video."
+    )
+
+
+def derive_style_guidance(prompts: List[str]) -> StyleGuidance:
+    """学習プロンプトからスタイル指針を作る.
+
+    Args:
+        prompts: プロンプト一覧.
+
+    Returns:
+        StyleGuidance: 指針.
+    """
+    if not prompts:
+        return StyleGuidance(sentence_target=2, use_semicolon=False, motion_words=[])
+    cleaned_prompts = [normalize_prompt_text(p) for p in prompts]
+    cleaned_prompts = [p for p in cleaned_prompts if p]
+    if not cleaned_prompts:
+        return StyleGuidance(sentence_target=2, use_semicolon=False, motion_words=[])
+    sentence_counts = []
+    semicolon_count = 0
+    motion_vocab = [
+        "continuous",
+        "loop",
+        "looping",
+        "repeat",
+        "repeating",
+        "steady",
+        "gentle",
+        "seamless",
+        "rhythm",
+        "cadence",
+        "drift",
+        "glide",
+        "sway",
+        "slow",
+    ]
+    motion_hits = {word: 0 for word in motion_vocab}
+    for prompt in cleaned_prompts:
+        parts = [p for p in re.split(r"[.!?]+", prompt.strip()) if p.strip()]
+        sentence_counts.append(len(parts))
+        if ";" in prompt:
+            semicolon_count += 1
+        lower = prompt.lower()
+        for word in motion_vocab:
+            if word in lower:
+                motion_hits[word] += 1
+    sentence_target = int(np.median(sentence_counts)) if sentence_counts else 2
+    sentence_target = max(2, min(3, sentence_target))
+    use_semicolon = semicolon_count / max(1, len(cleaned_prompts)) >= 0.3
+    motion_sorted = sorted(motion_hits.items(), key=lambda x: x[1], reverse=True)
+    motion_words = [w for w, c in motion_sorted if c > 0][:6]
+    return StyleGuidance(
+        sentence_target=sentence_target,
+        use_semicolon=use_semicolon,
+        motion_words=motion_words,
     )
 
 
@@ -609,6 +690,33 @@ def load_train_prompts(train_csv: Path) -> List[str]:
     return df["prompt_en"].astype(str).tolist()
 
 
+def normalize_prompt_text(text: str) -> str:
+    """プロンプト文字列を正規化する.
+
+    Args:
+        text: 文字列.
+
+    Returns:
+        str: 正規化後の文字列.
+    """
+    if not text:
+        return ""
+    replacements = {
+        "’": "'",
+        "‘": "'",
+        "“": '"',
+        "”": '"',
+        "–": "-",
+        "—": "-",
+        "…": "...",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    text = re.sub(r"[^\x00-\x7F]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 def list_test_videos(test_movie_dir: Path) -> List[Path]:
     """テスト動画一覧を取得する.
 
@@ -648,19 +756,27 @@ def main() -> None:
     num_workers = config.num_workers
     if num_workers <= 0:
         num_workers = min(4, max(1, os.cpu_count() or 1))
+    style_guidance = derive_style_guidance(prompts)
     if config.prompt_text:
         prompt_text = config.prompt_text
     elif config.use_train_style:
         prompt_text = build_style_prompt(
-            prompts, config.style_samples, config.style_seed, token_limit
+            prompts,
+            config.style_samples,
+            config.style_seed,
+            token_limit,
+            style_guidance,
         )
     else:
         limit_text = ""
         if token_limit > 0:
             limit_text = f" Limit to {token_limit} tokens or fewer."
+        motion_hint = ""
+        if style_guidance.motion_words:
+            motion_hint = " Use words like " + ", ".join(style_guidance.motion_words) + "."
         prompt_text = (
-            "Describe the video briefly with the main subject, action, and setting."
-            f"{limit_text}"
+            "Describe the video with subject, action, setting, and motion."
+            f"{motion_hint}{limit_text}"
         )
     test_videos = list_test_videos(config.test_movie_dir)
 

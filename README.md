@@ -5,6 +5,7 @@ ryushicup2026 baseline
 - SentenceTransformer(all-MiniLM-L6-v2)でキャプションを埋め込み
 - 予測埋め込みをsubmission.csvで出力
 - train.csvのprompt_enからトークン上限を推定して出力長を制限
+- train.csvの文体特徴（文数・セミコロン頻度・動き語彙）を抽出してプロンプト指示に反映
 
 前提
 - ffmpeg/ffprobe が PATH にあること
@@ -59,4 +60,9 @@ python src/baseline.py \
   --max-frames 8 \
   --debug \
   --allow-missing-ffmpeg
+```
+
+アンサンブル（平均）
+```
+python src/ensemble.py --input-csvs results/submission_a.csv results/submission_b.csv --output-path results/ensemble.csv
 ```

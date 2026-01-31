@@ -582,13 +582,38 @@ def normalize_encoder_name(encoder: str) -> str:
         正規化後のエンコーダ名。
     """
 
+    if encoder.startswith(("tu-", "timm-")):
+        return encoder
     convnext_aliases = {
         "convnext_tiny": "tu-convnext_tiny",
         "convnext_small": "tu-convnext_small",
         "convnext_base": "tu-convnext_base",
         "convnext_large": "tu-convnext_large",
     }
-    return convnext_aliases.get(encoder, encoder)
+    if encoder in convnext_aliases:
+        return convnext_aliases[encoder]
+    if encoder.startswith("convnextv2_"):
+        return f"tu-{encoder}"
+    if encoder.startswith("convnextv3_"):
+        return f"tu-{encoder}"
+    return encoder
+
+
+def is_timm_model_available(name: str) -> bool:
+    """timmモデルの存在を確認する。
+
+    Args:
+        name: timmモデル名。
+
+    Returns:
+        利用可能ならTrue。
+    """
+
+    try:
+        import timm
+    except Exception:
+        return False
+    return name in timm.list_models(name)
 
 
 class FilteredEncoder(nn.Module):
@@ -890,15 +915,24 @@ def resolve_model(config: Config, in_channels: int) -> nn.Module:
 
     try:
         if encoder_name.startswith(("tu-", "timm-")):
-            try:
-                return build_custom_model(arch, encoder_name, config.encoder_weights, in_channels)
-            except ValueError as exc:
+            timm_name = encoder_name.replace("timm-", "").replace("tu-", "")
+            if not is_timm_model_available(timm_name):
                 fallback = "resnet34" if "resnet34" in available_encoders else available_encoders[0]
                 print(
-                    "ConvNeXt互換モデルの構築に失敗したため、"
+                    "指定timmモデルが見つからないため、"
                     f"{encoder_name} -> {fallback} に切り替えます。"
                 )
                 encoder_name = fallback
+            else:
+                try:
+                    return build_custom_model(arch, encoder_name, config.encoder_weights, in_channels)
+                except ValueError as exc:
+                    fallback = "resnet34" if "resnet34" in available_encoders else available_encoders[0]
+                    print(
+                        "ConvNeXt互換モデルの構築に失敗したため、"
+                        f"{encoder_name} -> {fallback} に切り替えます。"
+                    )
+                    encoder_name = fallback
         model = model_cls(
             encoder_name=encoder_name,
             encoder_weights=config.encoder_weights,

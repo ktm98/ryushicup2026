@@ -668,6 +668,17 @@ def resolve_model(config: Config, in_channels: int) -> nn.Module:
 
     arch = config.arch.lower()
     encoder_name = normalize_encoder_name(config.encoder)
+    available_encoders = []
+    if hasattr(smp, "encoders") and hasattr(smp.encoders, "get_encoder_names"):
+        available_encoders = smp.encoders.get_encoder_names()
+    if available_encoders and encoder_name not in available_encoders:
+        fallback = "resnet34" if "resnet34" in available_encoders else available_encoders[0]
+        print(
+            "指定エンコーダが未対応のため、"
+            f"{encoder_name} -> {fallback} に切り替えます。"
+        )
+        print("ConvNeXtを使う場合は、segmentation_models_pytorch と timm の更新が必要です。")
+        encoder_name = fallback
     if arch == "unet":
         model_cls = smp.Unet
     elif arch == "unetplusplus":

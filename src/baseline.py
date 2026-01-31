@@ -19,10 +19,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
 
@@ -75,6 +74,10 @@ class Config:
         scheduler: 学習率スケジューラ。
         pin_memory: DataLoaderのpin_memory。
         context_slices: 前後スライス数。
+        auto_threshold: 検証でしきい値探索するか。
+        thresholds: しきい値候補。
+        sampler: サンプラー種類。
+        pos_boost: 正例サンプルの重み強化。
     """
 
     input_dir: Path
@@ -105,6 +108,10 @@ class Config:
     scheduler: str
     pin_memory: bool
     context_slices: int
+    auto_threshold: bool
+    thresholds: List[float]
+    sampler: str
+    pos_boost: float
 
 
 class SegmentationDataset(Dataset):
@@ -517,6 +524,39 @@ def build_normalization_stats(num_channels: int) -> Tuple[List[float], List[floa
     return mean, std
 
 
+def compute_sample_weights(
+    image_ids: List[str],
+    label_dir: Path,
+    img_size: int,
+    pos_boost: float,
+) -> List[float]:
+    """サンプル重みを計算する。
+
+    Args:
+        image_ids: 画像ID一覧。
+        label_dir: ラベルディレクトリ。
+        img_size: 画像サイズ。
+        pos_boost: 正例サンプルの重み強化。
+
+    Returns:
+        重みリスト。
+    """
+
+    weights: List[float] = []
+    for image_id in image_ids:
+        label_path = label_dir / f"{image_id}.png"
+        if not label_path.exists():
+            weights.append(1.0)
+            continue
+        label = Image.open(label_path)
+        if label.size != (img_size, img_size):
+            label = label.resize((img_size, img_size), resample=Image.NEAREST)
+        mask = np.array(label) == 2
+        has_pos = float(mask.any())
+        weights.append(1.0 + pos_boost * has_pos)
+    return weights
+
+
 def split_by_crop_id(
     image_ids: List[str], metadata: Dict[str, Dict[str, int]], val_ratio: float, seed: int
 ) -> Tuple[List[str], List[str]]:
@@ -700,7 +740,7 @@ def train_epoch(
         masks = masks.to(device)
 
         optimizer.zero_grad()
-        with autocast(enabled=use_amp):
+        with autocast_context(use_amp):
             outputs = model(images)
             loss = criterion(outputs, masks)
 
@@ -729,8 +769,10 @@ def validate(
     criterion: nn.Module,
     device: torch.device,
     threshold: float,
+    thresholds: List[float],
+    auto_threshold: bool,
     use_amp: bool,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
     """検証を実行する。
 
     Args:
@@ -739,27 +781,54 @@ def validate(
         criterion: 損失関数。
         device: デバイス。
         threshold: Diceしきい値。
+        thresholds: しきい値候補。
+        auto_threshold: しきい値探索の有無。
         use_amp: AMPの有無。
 
     Returns:
-        (loss, dice)。
+        (loss, dice, best_threshold)。
     """
 
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
+    best_threshold = threshold
+    if auto_threshold:
+        threshold_stats = {
+            "inter": torch.zeros(len(thresholds), device=device),
+            "pred": torch.zeros(len(thresholds), device=device),
+            "target": torch.tensor(0.0, device=device),
+        }
 
     for images, masks, _ in tqdm(loader, desc="Val"):
         images = images.to(device)
         masks = masks.to(device)
-        with autocast(enabled=use_amp):
+        with autocast_context(use_amp):
             outputs = model(images)
             loss = criterion(outputs, masks)
         total_loss += float(loss.item())
-        total_dice += float(dice_score(outputs, masks, threshold).item())
+        if auto_threshold:
+            probs = torch.sigmoid(outputs)
+            threshold_stats["target"] += masks.sum()
+            for idx, value in enumerate(thresholds):
+                pred = (probs > value).float()
+                threshold_stats["inter"][idx] += (pred * masks).sum()
+                threshold_stats["pred"][idx] += pred.sum()
+        else:
+            total_dice += float(dice_score(outputs, masks, threshold).item())
 
     n = len(loader)
-    return total_loss / n, total_dice / n
+    if auto_threshold:
+        target_sum = threshold_stats["target"]
+        dices = (
+            2.0 * threshold_stats["inter"]
+        ) / (threshold_stats["pred"] + target_sum + 1e-8)
+        best_idx = int(torch.argmax(dices).item())
+        best_threshold = thresholds[best_idx]
+        total_dice = float(dices[best_idx].item())
+    else:
+        total_dice = total_dice / n
+    return total_loss / n, total_dice, best_threshold
 
 
 def apply_flip(tensor: torch.Tensor, mode: Optional[str]) -> torch.Tensor:
@@ -799,7 +868,7 @@ def predict_probabilities(
     """
 
     if not use_tta:
-        with autocast(enabled=use_amp):
+        with autocast_context(use_amp):
             logits = model(images)
         return torch.sigmoid(logits)
 
@@ -807,7 +876,7 @@ def predict_probabilities(
     probs = []
     for mode in modes:
         augmented = apply_flip(images, mode)
-        with autocast(enabled=use_amp):
+        with autocast_context(use_amp):
             logits = model(augmented)
         prob = torch.sigmoid(logits)
         prob = apply_flip(prob, mode)
@@ -907,7 +976,7 @@ def parse_args() -> Config:
         choices=["unet", "unetplusplus", "efficientunetplusplus", "deeplabv3plus", "fpn"],
         help="アーキテクチャ",
     )
-    parser.add_argument("--encoder", type=str, default="resnet34", help="エンコーダ名")
+    parser.add_argument("--encoder", type=str, default="convnext_tiny", help="エンコーダ名")
     parser.add_argument(
         "--encoder-weights",
         type=str,
@@ -927,6 +996,17 @@ def parse_args() -> Config:
     parser.add_argument("--tversky-alpha", type=float, default=0.7, help="Tversky alpha")
     parser.add_argument("--tversky-beta", type=float, default=0.3, help="Tversky beta")
     parser.add_argument("--threshold", type=float, default=0.5, help="推論しきい値")
+    parser.add_argument("--auto-threshold", action="store_true", help="検証でしきい値を探索する")
+    parser.add_argument(
+        "--thresholds",
+        type=float,
+        nargs="+",
+        default=None,
+        help="しきい値候補 (例: 0.35 0.4 0.45)",
+    )
+    parser.add_argument("--threshold-min", type=float, default=0.3, help="しきい値探索の最小値")
+    parser.add_argument("--threshold-max", type=float, default=0.7, help="しきい値探索の最大値")
+    parser.add_argument("--threshold-step", type=float, default=0.05, help="しきい値探索の刻み")
     parser.add_argument("--min-area", type=int, default=0, help="最小面積フィルタ")
     parser.add_argument("--tta", action="store_true", help="推論時TTAを使う")
     parser.add_argument("--amp", action="store_true", help="AMPを使う")
@@ -944,12 +1024,34 @@ def parse_args() -> Config:
         default=1,
         help="前後スライス数 (0で2D)",
     )
+    parser.add_argument(
+        "--sampler",
+        type=str,
+        default="none",
+        choices=["none", "weighted"],
+        help="学習サンプラー",
+    )
+    parser.add_argument("--pos-boost", type=float, default=2.0, help="正例サンプルの重み強化")
 
     args = parser.parse_args()
     if not (0.0 < args.val_ratio < 1.0):
         raise ValueError("val_ratio は 0〜1 の範囲で指定してください。")
     if args.context_slices < 0:
         raise ValueError("context_slices は 0 以上で指定してください。")
+    if args.threshold_min >= args.threshold_max:
+        raise ValueError("threshold-min は threshold-max より小さくしてください。")
+    if args.threshold_step <= 0:
+        raise ValueError("threshold-step は正の値で指定してください。")
+
+    thresholds = args.thresholds
+    if thresholds is None:
+        thresholds = []
+        value = args.threshold_min
+        while value <= args.threshold_max + 1e-8:
+            thresholds.append(round(value, 4))
+            value += args.threshold_step
+    if not thresholds:
+        raise ValueError("thresholds が空です。")
 
     encoder_weights = None if args.encoder_weights == "none" else args.encoder_weights
     return Config(
@@ -981,6 +1083,10 @@ def parse_args() -> Config:
         scheduler=args.scheduler,
         pin_memory=args.pin_memory,
         context_slices=args.context_slices,
+        auto_threshold=args.auto_threshold,
+        thresholds=thresholds,
+        sampler=args.sampler,
+        pos_boost=args.pos_boost,
     )
 
 
@@ -1096,6 +1202,10 @@ def main() -> None:
             scheduler=config.scheduler,
             pin_memory=False,
             context_slices=config.context_slices,
+            auto_threshold=config.auto_threshold,
+            thresholds=config.thresholds,
+            sampler=config.sampler,
+            pos_boost=config.pos_boost,
         )
 
     data_dir = resolve_data_root(config.input_dir)
@@ -1136,10 +1246,18 @@ def main() -> None:
         context_slices=config.context_slices,
     )
 
+    sampler = None
+    shuffle = True
+    if config.sampler == "weighted":
+        weights = compute_sample_weights(train_ids, label_dir, config.img_size, config.pos_boost)
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+        shuffle = False
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=shuffle,
+        sampler=sampler,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
     )
@@ -1160,6 +1278,8 @@ def main() -> None:
     scaler = GradScaler(enabled=config.amp)
 
     best_dice = -1.0
+    best_threshold = config.threshold
+    current_threshold = config.threshold
     best_path = config.output_dir / "best_model.pth"
     for epoch in range(config.epochs):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
@@ -1170,28 +1290,36 @@ def main() -> None:
             criterion,
             optimizer,
             device,
-            config.threshold,
+            current_threshold,
             scaler,
             config.amp,
             scheduler,
             step_per_batch,
         )
-        val_loss, val_dice = validate(
+        val_loss, val_dice, epoch_threshold = validate(
             model,
             val_loader,
             criterion,
             device,
-            config.threshold,
+            current_threshold,
+            config.thresholds,
+            config.auto_threshold,
             config.amp,
         )
+        if config.auto_threshold:
+            current_threshold = epoch_threshold
         if scheduler is not None and not step_per_batch:
             scheduler.step()
 
         print(f"Train Loss: {train_loss:.4f}, Dice: {train_dice:.4f}")
-        print(f"Val Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
+        if config.auto_threshold:
+            print(f"Val Loss: {val_loss:.4f}, Dice: {val_dice:.4f}, Th: {epoch_threshold:.3f}")
+        else:
+            print(f"Val Loss: {val_loss:.4f}, Dice: {val_dice:.4f}")
 
         if val_dice > best_dice:
             best_dice = val_dice
+            best_threshold = epoch_threshold
             best_path.parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), best_path)
             print(f"Saved best model (Dice: {best_dice:.4f})")
@@ -1199,6 +1327,8 @@ def main() -> None:
     print("\nGenerating predictions...")
     if best_path.exists():
         load_best_weights(model, best_path, device)
+    if config.auto_threshold:
+        print(f"Best threshold: {best_threshold:.3f}")
 
     test_image_dir = data_dir / "test" / "images"
     test_csv = data_dir / "test" / "test.csv"
@@ -1223,11 +1353,12 @@ def main() -> None:
         pin_memory=config.pin_memory,
     )
 
+    predict_threshold = best_threshold if config.auto_threshold else config.threshold
     predictions = predict(
         model,
         test_loader,
         device,
-        config.threshold,
+        predict_threshold,
         config.min_area,
         config.tta,
         config.amp,
@@ -1242,3 +1373,23 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+try:
+    from torch.amp import GradScaler as AmpGradScaler
+    from torch.amp import autocast as amp_autocast
+
+    AMP_DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def autocast_context(enabled: bool) -> amp_autocast:
+        return amp_autocast(device_type=AMP_DEVICE_TYPE, enabled=enabled)
+
+    GradScaler = AmpGradScaler
+except ImportError:  # pragma: no cover - 古いPyTorch向け
+    from torch.cuda.amp import GradScaler as AmpGradScaler
+    from torch.cuda.amp import autocast as amp_autocast
+
+    AMP_DEVICE_TYPE = None
+
+    def autocast_context(enabled: bool) -> amp_autocast:
+        return amp_autocast(enabled=enabled)
+
+    GradScaler = AmpGradScaler

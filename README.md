@@ -23,5 +23,9 @@
 - `--min-area`: 小さい予測マスクの除外
 - `--amp`: AMPの有効化
 - `--context-slices`: 2.5D用の前後スライス数（0で2D）
+- `--auto-threshold`: 検証でしきい値を探索
+- `--thresholds`: しきい値候補の明示指定
+- `--sampler`: 学習サンプラー（`weighted` など）
+- `--pos-boost`: 正例サンプルの重み強化
 
 `--help` で詳細を確認できます。

@@ -9,14 +9,13 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Iterable, List
 
 import shutil
 
 import numpy as np
 import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
+from tqdm import tqdm
 
 
 @dataclass
@@ -30,10 +29,15 @@ class Config:
     vllm_url: str
     model: str
     max_frames: int
-    top_k: int
     debug: bool
     prompt_text: str
     allow_missing_ffmpeg: bool
+    use_train_style: bool
+    style_samples: int
+    style_seed: int
+    sbert_model: str
+    token_limit: int
+    token_limit_percentile: int
 
 
 def parse_args() -> Config:
@@ -50,16 +54,16 @@ def parse_args() -> Config:
     parser.add_argument("--vllm-url", type=str, default="http://localhost:8000")
     parser.add_argument("--model", type=str, default="Qwen/Qwen3-VL")
     parser.add_argument("--max-frames", type=int, default=8)
-    parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--allow-missing-ffmpeg", action="store_true")
-    parser.add_argument(
-        "--prompt-text",
-        type=str,
-        default=(
-            "Describe the video briefly with the main subject, action, and setting."
-        ),
-    )
+    parser.add_argument("--prompt-text", type=str, default="")
+    parser.add_argument("--use-train-style", action="store_true", default=True)
+    parser.add_argument("--no-use-train-style", action="store_false", dest="use_train_style")
+    parser.add_argument("--style-samples", type=int, default=5)
+    parser.add_argument("--style-seed", type=int, default=42)
+    parser.add_argument("--sbert-model", type=str, default="all-MiniLM-L6-v2")
+    parser.add_argument("--token-limit", type=int, default=0)
+    parser.add_argument("--token-limit-percentile", type=int, default=95)
     args = parser.parse_args()
     return Config(
         input_dir=args.input_dir,
@@ -69,10 +73,15 @@ def parse_args() -> Config:
         vllm_url=args.vllm_url,
         model=args.model,
         max_frames=args.max_frames,
-        top_k=args.top_k,
         debug=args.debug,
         prompt_text=args.prompt_text,
         allow_missing_ffmpeg=args.allow_missing_ffmpeg,
+        use_train_style=args.use_train_style,
+        style_samples=args.style_samples,
+        style_seed=args.style_seed,
+        sbert_model=args.sbert_model,
+        token_limit=args.token_limit,
+        token_limit_percentile=args.token_limit_percentile,
     )
 
 
@@ -239,51 +248,107 @@ def call_vllm_chat(
         raise RuntimeError("vLLMの応答形式が不正です") from exc
 
 
-def build_tfidf(train_prompts: List[str]) -> TfidfVectorizer:
-    """TF-IDFを構築する.
+def build_style_prompt(
+    train_prompts: List[str], samples: int, seed: int, token_limit: int
+) -> str:
+    """学習プロンプトのスタイルに寄せた指示文を作る.
 
     Args:
         train_prompts: 学習プロンプト.
+        samples: サンプル数.
+        seed: 乱数シード.
 
     Returns:
-        TfidfVectorizer: 学習済みベクトライザ.
+        str: 指示文.
     """
-    vectorizer = TfidfVectorizer(stop_words="english")
-    vectorizer.fit(train_prompts)
-    return vectorizer
+    if not train_prompts:
+        return "Describe the video briefly with the main subject, action, and setting."
+    rng = np.random.default_rng(seed)
+    count = min(samples, len(train_prompts))
+    indices = rng.choice(len(train_prompts), size=count, replace=False)
+    examples = "\n".join(f"- {train_prompts[i]}" for i in indices)
+    limit_text = ""
+    if token_limit > 0:
+        limit_text = f" Limit to {token_limit} tokens or fewer."
+    return (
+        "You are given a short video. Write one English prompt in the same style as the examples. "
+        f"Focus on subject, action, setting, and motion. Use a single sentence without quotes.{limit_text}\n"
+        f"Examples:\n{examples}\nNow write the prompt for the video."
+    )
 
 
-def predict_embedding(
-    caption: str,
-    vectorizer: TfidfVectorizer,
-    train_matrix: np.ndarray,
-    train_embeddings: np.ndarray,
-    top_k: int,
-) -> Tuple[np.ndarray, List[Tuple[int, float]]]:
-    """キャプションから埋め込みを推定する.
+def count_tokens(text: str) -> int:
+    """簡易的にトークン数を数える.
 
     Args:
-        caption: 生成キャプション.
-        vectorizer: TF-IDF.
-        train_matrix: 学習文書行列.
-        train_embeddings: 学習埋め込み.
-        top_k: 上位数.
+        text: 文字列.
 
     Returns:
-        Tuple[np.ndarray, List[Tuple[int, float]]]: 予測埋め込みと近傍情報.
+        int: トークン数.
     """
-    query_vec = vectorizer.transform([caption])
-    sims = cosine_similarity(query_vec, train_matrix)[0]
-    if np.allclose(sims, 0):
-        pred = train_embeddings.mean(axis=0)
-        return pred, []
-    top_k = max(1, min(top_k, len(sims)))
-    top_idx = np.argsort(sims)[-top_k:][::-1]
-    weights = sims[top_idx]
-    weights = weights / (weights.sum() + 1e-8)
-    pred = np.average(train_embeddings[top_idx], axis=0, weights=weights)
-    neighbors = [(int(i), float(sims[i])) for i in top_idx]
-    return pred, neighbors
+    if not text:
+        return 0
+    return len(text.strip().split())
+
+
+def truncate_tokens(text: str, limit: int) -> str:
+    """トークン数を上限で切り詰める.
+
+    Args:
+        text: 文字列.
+        limit: 上限.
+
+    Returns:
+        str: 切り詰め後の文字列.
+    """
+    if limit <= 0:
+        return text
+    tokens = text.strip().split()
+    if len(tokens) <= limit:
+        return text
+    return " ".join(tokens[:limit])
+
+
+def estimate_token_limit(prompts: List[str], percentile: int) -> int:
+    """学習プロンプトからトークン数上限を推定する.
+
+    Args:
+        prompts: プロンプト一覧.
+        percentile: パーセンタイル.
+
+    Returns:
+        int: 上限値.
+    """
+    if not prompts:
+        return 0
+    lengths = [count_tokens(prompt) for prompt in prompts]
+    if not lengths:
+        return 0
+    percentile = max(1, min(100, percentile))
+    value = int(np.percentile(lengths, percentile))
+    return max(1, value)
+
+
+def embed_caption_sbert(caption: str, model_name: str) -> np.ndarray:
+    """SentenceTransformerで埋め込みを作る.
+
+    Args:
+        caption: キャプション.
+        model_name: モデル名.
+
+    Returns:
+        np.ndarray: 埋め込み.
+
+    Raises:
+        RuntimeError: モデルのロードに失敗した場合.
+    """
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception as exc:
+        raise RuntimeError("sentence-transformers が見つかりません") from exc
+    model = SentenceTransformer(model_name)
+    embedding = model.encode([caption], normalize_embeddings=True)[0]
+    return np.asarray(embedding, dtype=np.float32)
 
 
 def l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -330,20 +395,17 @@ def save_submission(output_path: Path, video_ids: List[int], embeddings: np.ndar
     df.to_csv(output_path, index=False)
 
 
-def load_train_data(train_csv: Path) -> Tuple[List[str], np.ndarray]:
-    """学習データを読み込む.
+def load_train_prompts(train_csv: Path) -> List[str]:
+    """学習プロンプトを読み込む.
 
     Args:
         train_csv: 学習CSVパス.
 
     Returns:
-        Tuple[List[str], np.ndarray]: プロンプトと埋め込み.
+        List[str]: プロンプト一覧.
     """
     df = pd.read_csv(train_csv)
-    prompt_list = df["prompt_en"].astype(str).tolist()
-    emb_cols = [col for col in df.columns if col.startswith("emb_")]
-    embeddings = df[emb_cols].to_numpy(dtype=np.float32)
-    return prompt_list, embeddings
+    return df["prompt_en"].astype(str).tolist()
 
 
 def list_test_videos(test_movie_dir: Path) -> List[Path]:
@@ -372,14 +434,31 @@ def main() -> None:
         print("警告: ffmpeg/ffprobe が見つかりません。ダミー画像で続行します。")
     if not config.train_csv.exists():
         raise RuntimeError("学習CSVが見つかりません")
-    prompts, train_embeddings = load_train_data(config.train_csv)
-    vectorizer = build_tfidf(prompts)
-    train_matrix = vectorizer.transform(prompts)
+    prompts = load_train_prompts(config.train_csv)
+    token_limit = config.token_limit
+    if token_limit <= 0:
+        token_limit = estimate_token_limit(prompts, config.token_limit_percentile)
+    if config.debug:
+        print(f"token_limit: {token_limit} (percentile={config.token_limit_percentile})")
+    if config.prompt_text:
+        prompt_text = config.prompt_text
+    elif config.use_train_style:
+        prompt_text = build_style_prompt(
+            prompts, config.style_samples, config.style_seed, token_limit
+        )
+    else:
+        limit_text = ""
+        if token_limit > 0:
+            limit_text = f" Limit to {token_limit} tokens or fewer."
+        prompt_text = (
+            "Describe the video briefly with the main subject, action, and setting."
+            f"{limit_text}"
+        )
     test_videos = list_test_videos(config.test_movie_dir)
 
     predictions = []
     debug_rows = []
-    for video_path in test_videos:
+    for video_path in tqdm(test_videos, desc="videos"):
         start_time = time.time()
         if ffmpeg_missing:
             frames = [dummy_image_data_url()]
@@ -388,12 +467,11 @@ def main() -> None:
         caption = call_vllm_chat(
             config.vllm_url,
             config.model,
-            config.prompt_text,
+            prompt_text,
             frames,
         )
-        pred, neighbors = predict_embedding(
-            caption, vectorizer, train_matrix, train_embeddings, config.top_k
-        )
+        caption = truncate_tokens(caption, token_limit)
+        pred = embed_caption_sbert(caption, config.sbert_model)
         pred = l2_normalize(pred)
         predictions.append(pred)
         if config.debug:
@@ -401,7 +479,6 @@ def main() -> None:
                 {
                     "video_id": int(video_path.stem),
                     "caption": caption,
-                    "neighbors": json.dumps(neighbors, ensure_ascii=True),
                     "elapsed_sec": round(time.time() - start_time, 3),
                 }
             )

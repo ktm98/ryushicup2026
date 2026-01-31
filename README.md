@@ -2,12 +2,14 @@ ryushicup2026 baseline
 
 概要
 - vLLM(OpenAI互換)のQwen3 VLで動画キャプションを生成
-- train.csvのprompt_enとTF-IDF類似度で近傍埋め込みを推定
+- SentenceTransformer(all-MiniLM-L6-v2)でキャプションを埋め込み
 - 予測埋め込みをsubmission.csvで出力
+- train.csvのprompt_enからトークン上限を推定して出力長を制限
 
 前提
 - ffmpeg/ffprobe が PATH にあること
 - vLLM サーバーが localhost で起動していること
+- SentenceTransformer を使う場合は初回にモデルがダウンロードされます
 
 モックサーバー起動
 ```
@@ -23,7 +25,8 @@ python src/baseline.py \
   --vllm-url http://localhost:8000 \
   --model Qwen/Qwen3-VL \
   --max-frames 8 \
-  --top-k 5 \
+  --use-train-style \
+  --token-limit-percentile 95 \
   --debug
 ```
 
@@ -36,7 +39,6 @@ python src/baseline.py \
   --vllm-url http://localhost:8000 \
   --model Qwen/Qwen3-VL \
   --max-frames 8 \
-  --top-k 5 \
   --debug \
   --allow-missing-ffmpeg
 ```

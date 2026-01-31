@@ -11,6 +11,7 @@ ryushicup2026 baseline
 - vLLM サーバーが localhost で起動していること
 - SentenceTransformer を使う場合は初回にモデルがダウンロードされます
 - vLLM への同時リクエスト数は --num-workers で調整できます（OOM対策で既定は1）
+- 動画をそのまま渡す場合は --use-video-input を指定してください
 
 モックサーバー起動
 ```
@@ -33,6 +34,15 @@ python src/baseline.py \
   --sbert-batch-size 8 \
   --debug
 ```
+
+動画をそのまま入力（ffmpeg不要）
+```
+python src/baseline.py --train-csv input/data/train.csv --test-movie-dir input/data/test_movie --output-path results/submission.csv --vllm-url http://localhost:8000 --model Qwen/Qwen3-VL --use-video-input --use-train-style --token-limit-percentile 95 --num-workers 1 --sbert-device cpu --sbert-batch-size 8 --debug
+```
+
+video入力でBad Requestが出る場合
+- `--video-payload-mode single` と `--video-content-type` / `--video-field` / `--video-data-format` / `--video-as-object` を調整してください
+- 例: `--video-payload-mode single --video-content-type video --video-field data --video-data-format base64 --video-as-object`
 
 ffmpeg/ffprobe が無い場合（デバッグ用）
 ```

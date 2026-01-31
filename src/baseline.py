@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -46,6 +47,11 @@ class Config:
     sbert_batch_size: int
     sbert_max_length: int
     use_video_input: bool
+    video_content_type: str
+    video_field: str
+    video_data_format: str
+    video_as_object: bool
+    video_payload_mode: str
 
 
 def parse_args() -> Config:
@@ -79,6 +85,17 @@ def parse_args() -> Config:
     parser.add_argument("--sbert-max-length", type=int, default=0)
     parser.add_argument("--use-video-input", action="store_true", default=False)
     parser.add_argument("--no-use-video-input", action="store_false", dest="use_video_input")
+    parser.add_argument("--video-content-type", type=str, default="video_url", choices=["video_url", "video"])
+    parser.add_argument("--video-field", type=str, default="url", choices=["url", "data"])
+    parser.add_argument("--video-data-format", type=str, default="data_url", choices=["data_url", "base64"])
+    parser.add_argument("--video-as-object", action="store_true", default=True)
+    parser.add_argument("--no-video-as-object", action="store_false", dest="video_as_object")
+    parser.add_argument(
+        "--video-payload-mode",
+        type=str,
+        default="auto",
+        choices=["auto", "single"],
+    )
     args = parser.parse_args()
     return Config(
         input_dir=args.input_dir,
@@ -103,6 +120,11 @@ def parse_args() -> Config:
         sbert_batch_size=args.sbert_batch_size,
         sbert_max_length=args.sbert_max_length,
         use_video_input=args.use_video_input,
+        video_content_type=args.video_content_type,
+        video_field=args.video_field,
+        video_data_format=args.video_data_format,
+        video_as_object=args.video_as_object,
+        video_payload_mode=args.video_payload_mode,
     )
 
 
@@ -225,12 +247,84 @@ def encode_video_base64(video_path: Path) -> str:
     return f"data:video/mp4;base64,{encoded}"
 
 
+def encode_video_base64_raw(video_path: Path) -> str:
+    """動画をbase64に変換する（プレフィックス無し）.
+
+    Args:
+        video_path: 動画パス.
+
+    Returns:
+        str: base64文字列.
+    """
+    data = video_path.read_bytes()
+    return base64.b64encode(data).decode("ascii")
+
+
+def build_video_content(
+    video_path: Path,
+    content_type: str,
+    field: str,
+    data_format: str,
+    as_object: bool,
+) -> dict:
+    """動画入力のcontentを作る.
+
+    Args:
+        video_path: 動画パス.
+        content_type: contentタイプ.
+        field: url/dataのどちらを使うか.
+        data_format: data_url/base64.
+        as_object: フィールドをオブジェクトにするか.
+
+    Returns:
+        dict: content要素.
+    """
+    if data_format == "data_url":
+        value = encode_video_base64(video_path)
+    else:
+        value = encode_video_base64_raw(video_path)
+    if as_object:
+        payload = {field: value}
+    else:
+        payload = value
+    return {"type": content_type, content_type: payload}
+
+
+def build_video_candidates(config: Config, video_path: Path) -> List[dict]:
+    """動画入力の候補を作る.
+
+    Args:
+        config: 設定.
+        video_path: 動画パス.
+
+    Returns:
+        List[dict]: content候補.
+    """
+    if config.video_payload_mode == "single":
+        return [
+            build_video_content(
+                video_path,
+                config.video_content_type,
+                config.video_field,
+                config.video_data_format,
+                config.video_as_object,
+            )
+        ]
+    return [
+        build_video_content(video_path, "video_url", "url", "data_url", True),
+        build_video_content(video_path, "video_url", "url", "base64", True),
+        build_video_content(video_path, "video", "data", "base64", True),
+        build_video_content(video_path, "video", "data", "data_url", True),
+        build_video_content(video_path, "video", "url", "data_url", True),
+    ]
+
+
 def call_vllm_chat(
     vllm_url: str,
     model: str,
     prompt_text: str,
     image_data_urls: Iterable[str],
-    video_data_url: Optional[str] = None,
+    video_content: Optional[dict] = None,
     timeout_sec: int = 60,
 ) -> str:
     """vLLM OpenAI互換APIを呼び出す.
@@ -250,13 +344,8 @@ def call_vllm_chat(
         RuntimeError: 応答が不正な場合.
     """
     content = [{"type": "text", "text": prompt_text}]
-    if video_data_url:
-        content.append(
-            {
-                "type": "video_url",
-                "video_url": {"url": video_data_url},
-            }
-        )
+    if video_content:
+        content.append(video_content)
     else:
         for data_url in image_data_urls:
             content.append(
@@ -281,6 +370,9 @@ def call_vllm_chat(
     try:
         with urllib.request.urlopen(request, timeout=timeout_sec) as response:
             body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"vLLM呼び出しに失敗しました: HTTP {exc.code} {detail}") from exc
     except Exception as exc:
         raise RuntimeError(f"vLLM呼び出しに失敗しました: {exc}") from exc
     try:
@@ -541,15 +633,28 @@ def main() -> None:
     def process_video(video_path: Path) -> dict:
         start_time = time.time()
         if config.use_video_input:
-            video_url = encode_video_base64(video_path)
-            caption = call_vllm_chat(
-                config.vllm_url,
-                config.model,
-                prompt_text,
-                [],
-                video_data_url=video_url,
-                timeout_sec=config.request_timeout,
-            )
+            caption = ""
+            payload_used = ""
+            candidates = build_video_candidates(config, video_path)
+            last_error: Optional[Exception] = None
+            for idx, candidate in enumerate(candidates):
+                try:
+                    caption = call_vllm_chat(
+                        config.vllm_url,
+                        config.model,
+                        prompt_text,
+                        [],
+                        video_content=candidate,
+                        timeout_sec=config.request_timeout,
+                    )
+                    payload_used = f"candidate_{idx}"
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if config.video_payload_mode == "single":
+                        break
+            if not caption and last_error:
+                raise RuntimeError(f"動画入力に失敗しました: {last_error}") from last_error
         else:
             if ffmpeg_missing:
                 frames = [dummy_image_data_url()]
@@ -562,10 +667,12 @@ def main() -> None:
                 frames,
                 timeout_sec=config.request_timeout,
             )
+            payload_used = "images"
         return {
             "video_id": int(video_path.stem),
             "caption": caption,
             "elapsed_sec": round(time.time() - start_time, 3),
+            "payload": payload_used,
         }
 
     if num_workers == 1:
@@ -579,6 +686,7 @@ def main() -> None:
                         "video_id": result["video_id"],
                         "caption": caption,
                         "elapsed_sec": result["elapsed_sec"],
+                        "payload": result["payload"],
                     }
                 )
                 print(f'{result["video_id"]}.mp4: {caption}')
@@ -595,6 +703,7 @@ def main() -> None:
                             "video_id": result["video_id"],
                             "caption": caption,
                             "elapsed_sec": result["elapsed_sec"],
+                            "payload": result["payload"],
                         }
                     )
                     tqdm.write(f'{result["video_id"]}.mp4: {caption}')

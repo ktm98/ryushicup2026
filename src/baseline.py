@@ -52,6 +52,8 @@ class Config:
     video_data_format: str
     video_as_object: bool
     video_payload_mode: str
+    video_fallback_to_frames: bool
+    frame_size: str
 
 
 def parse_args() -> Config:
@@ -96,6 +98,9 @@ def parse_args() -> Config:
         default="auto",
         choices=["auto", "single"],
     )
+    parser.add_argument("--video-fallback-to-frames", action="store_true", default=True)
+    parser.add_argument("--no-video-fallback-to-frames", action="store_false", dest="video_fallback_to_frames")
+    parser.add_argument("--frame-size", type=str, default="")
     args = parser.parse_args()
     return Config(
         input_dir=args.input_dir,
@@ -125,6 +130,8 @@ def parse_args() -> Config:
         video_data_format=args.video_data_format,
         video_as_object=args.video_as_object,
         video_payload_mode=args.video_payload_mode,
+        video_fallback_to_frames=args.video_fallback_to_frames,
+        frame_size=args.frame_size,
     )
 
 
@@ -180,7 +187,30 @@ def probe_duration(video_path: Path) -> float:
         return 0.0
 
 
-def extract_frames(video_path: Path, max_frames: int) -> List[str]:
+def parse_frame_size(frame_size: str) -> Optional[tuple[int, int]]:
+    """フレームサイズを解析する.
+
+    Args:
+        frame_size: "WIDTHxHEIGHT" 形式の文字列.
+
+    Returns:
+        Optional[tuple[int, int]]: 幅と高さ.
+
+    Raises:
+        RuntimeError: 形式が不正な場合.
+    """
+    if not frame_size:
+        return None
+    parts = frame_size.lower().split("x")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise RuntimeError("frame-size が不正です")
+    width, height = (int(parts[0]), int(parts[1]))
+    if width <= 0 or height <= 0:
+        raise RuntimeError("frame-size が不正です")
+    return width, height
+
+
+def extract_frames(video_path: Path, max_frames: int, frame_size: Optional[tuple[int, int]]) -> List[str]:
     """動画からフレームを抽出する.
 
     Args:
@@ -199,6 +229,15 @@ def extract_frames(video_path: Path, max_frames: int) -> List[str]:
     fps = 1.0
     if duration > 0:
         fps = max(1.0 / max(duration / max_frames, 1e-6), 0.1)
+    filters = [f"fps={fps}"]
+    if frame_size:
+        width, height = frame_size
+        filters.append(
+            "scale="
+            f"{width}:{height}"
+            ":force_original_aspect_ratio=decrease"
+        )
+        filters.append(f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
     with tempfile.TemporaryDirectory() as temp_dir:
         out_pattern = Path(temp_dir) / "frame_%03d.jpg"
         command = [
@@ -207,7 +246,7 @@ def extract_frames(video_path: Path, max_frames: int) -> List[str]:
             "-i",
             str(video_path),
             "-vf",
-            f"fps={fps}",
+            ",".join(filters),
             "-frames:v",
             str(max_frames),
             str(out_pattern),
@@ -313,9 +352,6 @@ def build_video_candidates(config: Config, video_path: Path) -> List[dict]:
     return [
         build_video_content(video_path, "video_url", "url", "data_url", True),
         build_video_content(video_path, "video_url", "url", "base64", True),
-        build_video_content(video_path, "video", "data", "base64", True),
-        build_video_content(video_path, "video", "data", "data_url", True),
-        build_video_content(video_path, "video", "url", "data_url", True),
     ]
 
 
@@ -593,6 +629,8 @@ def main() -> None:
     if config.debug:
         print("デバッグモード: 有効")
     ffmpeg_missing = shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None
+    if config.use_video_input and config.video_fallback_to_frames and ffmpeg_missing:
+        print("警告: 動画入力が失敗した場合にフレームへフォールバックできません。")
     if not config.use_video_input:
         if ffmpeg_missing and not config.allow_missing_ffmpeg:
             raise RuntimeError("ffmpeg/ffprobe が見つかりません")
@@ -601,6 +639,7 @@ def main() -> None:
     if not config.train_csv.exists():
         raise RuntimeError("学習CSVが見つかりません")
     prompts = load_train_prompts(config.train_csv)
+    frame_size = parse_frame_size(config.frame_size)
     token_limit = config.token_limit
     if token_limit <= 0:
         token_limit = estimate_token_limit(prompts, config.token_limit_percentile)
@@ -647,19 +686,33 @@ def main() -> None:
                         video_content=candidate,
                         timeout_sec=config.request_timeout,
                     )
-                    payload_used = f"candidate_{idx}"
+                    payload_used = f"{candidate.get('type','unknown')}_{idx}"
                     break
                 except Exception as exc:
                     last_error = exc
                     if config.video_payload_mode == "single":
                         break
             if not caption and last_error:
-                raise RuntimeError(f"動画入力に失敗しました: {last_error}") from last_error
+                error_text = str(last_error)
+                if config.video_fallback_to_frames:
+                    if ffmpeg_missing:
+                        raise RuntimeError("動画入力に失敗しました。ffmpeg/ffprobe が必要です") from last_error
+                    frames = extract_frames(video_path, config.max_frames, frame_size)
+                    caption = call_vllm_chat(
+                        config.vllm_url,
+                        config.model,
+                        prompt_text,
+                        frames,
+                        timeout_sec=config.request_timeout,
+                    )
+                    payload_used = "fallback_images"
+                else:
+                    raise RuntimeError(f"動画入力に失敗しました: {error_text}") from last_error
         else:
             if ffmpeg_missing:
                 frames = [dummy_image_data_url()]
             else:
-                frames = extract_frames(video_path, config.max_frames)
+                frames = extract_frames(video_path, config.max_frames, frame_size)
             caption = call_vllm_chat(
                 config.vllm_url,
                 config.model,

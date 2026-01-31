@@ -12,4 +12,5 @@ dependencies = [
     "scikit-learn>=1.8.0",
     "tqdm>=4.67.1",
     "sentence-transformers>=3.0.1",
+    "opencv-python>=4.13.0.90",
 ]

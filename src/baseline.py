@@ -1115,24 +1115,49 @@ def validate(
     return total_loss / n, total_dice, best_threshold
 
 
-def apply_flip(tensor: torch.Tensor, mode: Optional[str]) -> torch.Tensor:
-    """テンソルのフリップを適用する。
+def apply_tta_ops(tensor: torch.Tensor, ops: List[str]) -> torch.Tensor:
+    """TTAの操作列を適用する。
 
     Args:
         tensor: 入力テンソル。
-        mode: フリップ種別。
+        ops: 操作列。
 
     Returns:
         変換後テンソル。
     """
 
-    if mode == "h":
-        return torch.flip(tensor, dims=[3])
-    if mode == "v":
-        return torch.flip(tensor, dims=[2])
-    if mode == "hv":
-        return torch.flip(tensor, dims=[2, 3])
-    return tensor
+    out = tensor
+    for op in ops:
+        if op == "h":
+            out = torch.flip(out, dims=[3])
+        elif op == "v":
+            out = torch.flip(out, dims=[2])
+        elif op == "t":
+            out = out.transpose(2, 3)
+    return out
+
+
+def tta_ops_from_mode(mode: Optional[str]) -> List[str]:
+    """TTAモードから操作列を作る。
+
+    Args:
+        mode: モード文字列。
+
+    Returns:
+        操作列。
+    """
+
+    mapping = {
+        None: [],
+        "h": ["h"],
+        "v": ["v"],
+        "hv": ["h", "v"],
+        "t": ["t"],
+        "th": ["t", "h"],
+        "tv": ["t", "v"],
+        "thv": ["t", "h", "v"],
+    }
+    return mapping.get(mode, [])
 
 
 @torch.no_grad()
@@ -1156,14 +1181,15 @@ def predict_probabilities(
             logits = model(images)
         return torch.sigmoid(logits)
 
-    modes = [None, "h", "v", "hv"]
+    modes = [None, "h", "v", "hv", "t", "th", "tv", "thv"]
     probs = []
     for mode in modes:
-        augmented = apply_flip(images, mode)
+        ops = tta_ops_from_mode(mode)
+        augmented = apply_tta_ops(images, ops)
         with autocast_context(use_amp):
             logits = model(augmented)
         prob = torch.sigmoid(logits)
-        prob = apply_flip(prob, mode)
+        prob = apply_tta_ops(prob, list(reversed(ops)))
         probs.append(prob)
     return torch.stack(probs).mean(0)
 

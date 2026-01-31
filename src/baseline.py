@@ -24,6 +24,28 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, OneCycleLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
+try:
+    from torch.amp import GradScaler as AmpGradScaler
+    from torch.amp import autocast as amp_autocast
+
+    AMP_DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def autocast_context(enabled: bool) -> amp_autocast:
+        return amp_autocast(device_type=AMP_DEVICE_TYPE, enabled=enabled)
+
+    GradScaler = AmpGradScaler
+except ImportError:  # pragma: no cover - 古いPyTorch向け
+    from torch.cuda.amp import GradScaler as AmpGradScaler
+    from torch.cuda.amp import autocast as amp_autocast
+
+    AMP_DEVICE_TYPE = None
+
+    def autocast_context(enabled: bool) -> amp_autocast:
+        return amp_autocast(enabled=enabled)
+
+    GradScaler = AmpGradScaler
+
+
 
 try:
     import segmentation_models_pytorch as smp
@@ -31,6 +53,16 @@ try:
     SMP_AVAILABLE = True
 except ImportError:
     SMP_AVAILABLE = False
+
+try:
+    if SMP_AVAILABLE:
+        from segmentation_models_pytorch.base import SegmentationHead
+        from segmentation_models_pytorch.base import model as smp_base_model
+        from segmentation_models_pytorch.decoders.unet.decoder import UnetDecoder
+        from segmentation_models_pytorch.decoders.unetplusplus.decoder import UnetPlusPlusDecoder
+        from segmentation_models_pytorch.encoders import get_encoder
+except Exception:  # pragma: no cover - オプション依存
+    pass
 
 try:
     import albumentations as A
@@ -383,6 +415,22 @@ def dice_score(pred: torch.Tensor, target: torch.Tensor, threshold: float) -> to
     return (2.0 * intersection) / (pred_sum + target_sum + 1e-8)
 
 
+def resize_logits_like(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """ロジットをターゲットの空間サイズに合わせる。
+
+    Args:
+        logits: 予測ロジット。
+        target: 参照テンソル。
+
+    Returns:
+        リサイズ済みロジット。
+    """
+
+    if logits.shape[-2:] == target.shape[-2:]:
+        return logits
+    return F.interpolate(logits, size=target.shape[-2:], mode="bilinear", align_corners=False)
+
+
 def rle_encode(mask: np.ndarray) -> str:
     """RLE形式に変換する。
 
@@ -535,12 +583,153 @@ def normalize_encoder_name(encoder: str) -> str:
     """
 
     convnext_aliases = {
-        "convnext_tiny": "timm-convnext_tiny",
-        "convnext_small": "timm-convnext_small",
-        "convnext_base": "timm-convnext_base",
-        "convnext_large": "timm-convnext_large",
+        "convnext_tiny": "tu-convnext_tiny",
+        "convnext_small": "tu-convnext_small",
+        "convnext_base": "tu-convnext_base",
+        "convnext_large": "tu-convnext_large",
     }
     return convnext_aliases.get(encoder, encoder)
+
+
+class FilteredEncoder(nn.Module):
+    """特徴マップから0チャンネルを除外するラッパー。
+
+    Args:
+        encoder: 元のエンコーダ。
+        keep_indices: 残すインデックス。
+    """
+
+    def __init__(self, encoder: nn.Module, keep_indices: List[int]) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.keep_indices = keep_indices
+        self.out_channels = [encoder.out_channels[i] for i in keep_indices]
+        self.output_stride = getattr(encoder, "output_stride", 32)
+        self.name = getattr(encoder, "name", encoder.__class__.__name__)
+
+    def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
+        features = self.encoder(x)
+        return [features[i] for i in self.keep_indices]
+
+
+class SimpleSegmentationModel(smp_base_model.SegmentationModel):
+    """簡易セグメンテーションモデル。
+
+    Args:
+        encoder: エンコーダ。
+        decoder: デコーダ。
+        segmentation_head: セグメンテーションヘッド。
+        name: モデル名。
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        decoder: nn.Module,
+        segmentation_head: nn.Module,
+        name: str,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.segmentation_head = segmentation_head
+        self.classification_head = None
+        self.name = name
+        self.initialize()
+
+
+def filter_zero_channel_encoder(encoder: nn.Module) -> nn.Module:
+    """0チャンネルの特徴を除外したエンコーダにする。
+
+    Args:
+        encoder: 元のエンコーダ。
+
+    Returns:
+        フィルタ済みエンコーダ。
+    """
+
+    out_channels = list(getattr(encoder, "out_channels", []))
+    keep_indices = [idx for idx, ch in enumerate(out_channels) if ch > 0]
+    if len(keep_indices) == len(out_channels):
+        return encoder
+    return FilteredEncoder(encoder, keep_indices)
+
+
+def build_decoder_channels(depth: int) -> Tuple[int, ...]:
+    """デコーダチャンネルを生成する。
+
+    Args:
+        depth: デコーダブロック数。
+
+    Returns:
+        デコーダチャンネル。
+    """
+
+    base = (256, 128, 64, 32, 16)
+    if depth <= 0:
+        raise ValueError("decoder depth が不正です。")
+    return tuple(base[:depth])
+
+
+def build_custom_model(
+    arch: str,
+    encoder_name: str,
+    encoder_weights: Optional[str],
+    in_channels: int,
+) -> nn.Module:
+    """カスタムでモデルを構築する。
+
+    Args:
+        arch: アーキテクチャ名。
+        encoder_name: エンコーダ名。
+        encoder_weights: エンコーダ重み。
+        in_channels: 入力チャンネル数。
+
+    Returns:
+        モデル。
+    """
+
+    encoder = get_encoder(
+        encoder_name,
+        in_channels=in_channels,
+        depth=5,
+        weights=encoder_weights,
+    )
+    encoder = filter_zero_channel_encoder(encoder)
+    depth = len(encoder.out_channels) - 1
+    decoder_channels = build_decoder_channels(depth)
+
+    if arch == "unetplusplus":
+        decoder = UnetPlusPlusDecoder(
+            encoder_channels=encoder.out_channels,
+            decoder_channels=decoder_channels,
+            n_blocks=depth,
+            use_norm="batchnorm",
+            center=encoder_name.startswith("vgg"),
+            attention_type=None,
+            interpolation_mode="nearest",
+        )
+    elif arch == "unet":
+        decoder = UnetDecoder(
+            encoder_channels=encoder.out_channels,
+            decoder_channels=decoder_channels,
+            n_blocks=depth,
+            use_norm="batchnorm",
+            attention_type=None,
+            add_center_block=encoder_name.startswith("vgg"),
+            interpolation_mode="nearest",
+        )
+    else:
+        raise ValueError("このアーキテクチャはConvNeXtに未対応です。")
+
+    segmentation_head = SegmentationHead(
+        in_channels=decoder_channels[-1],
+        out_channels=1,
+        activation=None,
+        kernel_size=3,
+    )
+    model_name = f"{arch}-{encoder_name}"
+    return SimpleSegmentationModel(encoder, decoder, segmentation_head, model_name)
 
 
 def compute_sample_weights(
@@ -668,10 +857,15 @@ def resolve_model(config: Config, in_channels: int) -> nn.Module:
 
     arch = config.arch.lower()
     encoder_name = normalize_encoder_name(config.encoder)
-    available_encoders = []
+    available_encoders: List[str] = []
     if hasattr(smp, "encoders") and hasattr(smp.encoders, "get_encoder_names"):
         available_encoders = smp.encoders.get_encoder_names()
-    if available_encoders and encoder_name not in available_encoders:
+    if (
+        available_encoders
+        and encoder_name not in available_encoders
+        and not encoder_name.startswith("tu-")
+        and not encoder_name.startswith("timm-")
+    ):
         fallback = "resnet34" if "resnet34" in available_encoders else available_encoders[0]
         print(
             "指定エンコーダが未対応のため、"
@@ -695,6 +889,16 @@ def resolve_model(config: Config, in_channels: int) -> nn.Module:
         raise ValueError("アーキテクチャの指定が不正です。")
 
     try:
+        if encoder_name.startswith(("tu-", "timm-")):
+            try:
+                return build_custom_model(arch, encoder_name, config.encoder_weights, in_channels)
+            except ValueError as exc:
+                fallback = "resnet34" if "resnet34" in available_encoders else available_encoders[0]
+                print(
+                    "ConvNeXt互換モデルの構築に失敗したため、"
+                    f"{encoder_name} -> {fallback} に切り替えます。"
+                )
+                encoder_name = fallback
         model = model_cls(
             encoder_name=encoder_name,
             encoder_weights=config.encoder_weights,
@@ -773,6 +977,7 @@ def train_epoch(
         optimizer.zero_grad()
         with autocast_context(use_amp):
             outputs = model(images)
+            outputs = resize_logits_like(outputs, masks)
             loss = criterion(outputs, masks)
 
         if use_amp:
@@ -836,6 +1041,7 @@ def validate(
         masks = masks.to(device)
         with autocast_context(use_amp):
             outputs = model(images)
+            outputs = resize_logits_like(outputs, masks)
             loss = criterion(outputs, masks)
         total_loss += float(loss.item())
         if auto_threshold:
@@ -964,6 +1170,8 @@ def predict(
     for images, _, image_ids in tqdm(loader, desc="Predict"):
         images = images.to(device)
         probs = predict_probabilities(model, images, use_tta, use_amp)
+        if probs.shape[-2:] != images.shape[-2:]:
+            probs = F.interpolate(probs, size=images.shape[-2:], mode="bilinear", align_corners=False)
         preds = (probs > threshold).cpu().numpy()
 
         for pred, image_id in zip(preds, image_ids):
@@ -1007,7 +1215,7 @@ def parse_args() -> Config:
         choices=["unet", "unetplusplus", "efficientunetplusplus", "deeplabv3plus", "fpn"],
         help="アーキテクチャ",
     )
-    parser.add_argument("--encoder", type=str, default="timm-convnext_tiny", help="エンコーダ名")
+    parser.add_argument("--encoder", type=str, default="tu-convnext_tiny", help="エンコーダ名")
     parser.add_argument(
         "--encoder-weights",
         type=str,
@@ -1404,23 +1612,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-try:
-    from torch.amp import GradScaler as AmpGradScaler
-    from torch.amp import autocast as amp_autocast
-
-    AMP_DEVICE_TYPE = "cuda" if torch.cuda.is_available() else "cpu"
-
-    def autocast_context(enabled: bool) -> amp_autocast:
-        return amp_autocast(device_type=AMP_DEVICE_TYPE, enabled=enabled)
-
-    GradScaler = AmpGradScaler
-except ImportError:  # pragma: no cover - 古いPyTorch向け
-    from torch.cuda.amp import GradScaler as AmpGradScaler
-    from torch.cuda.amp import autocast as amp_autocast
-
-    AMP_DEVICE_TYPE = None
-
-    def autocast_context(enabled: bool) -> amp_autocast:
-        return amp_autocast(enabled=enabled)
-
-    GradScaler = AmpGradScaler

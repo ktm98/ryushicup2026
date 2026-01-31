@@ -118,6 +118,8 @@ class Config:
     epochs: int
     lr: float
     weight_decay: float
+    beta1: float
+    beta2: float
     num_workers: int
     img_size: int
     device: str
@@ -144,6 +146,9 @@ class Config:
     thresholds: List[float]
     sampler: str
     pos_boost: float
+    onecycle_pct_start: float
+    onecycle_div_factor: float
+    onecycle_final_div_factor: float
 
 
 class SegmentationDataset(Dataset):
@@ -962,7 +967,15 @@ def build_scheduler(
         return CosineAnnealingLR(optimizer, T_max=config.epochs), False
     if config.scheduler == "onecycle":
         return (
-            OneCycleLR(optimizer, max_lr=config.lr, epochs=config.epochs, steps_per_epoch=steps_per_epoch),
+            OneCycleLR(
+                optimizer,
+                max_lr=config.lr,
+                epochs=config.epochs,
+                steps_per_epoch=steps_per_epoch,
+                pct_start=config.onecycle_pct_start,
+                div_factor=config.onecycle_div_factor,
+                final_div_factor=config.onecycle_final_div_factor,
+            ),
             True,
         )
     if config.scheduler == "none":
@@ -1229,8 +1242,10 @@ def parse_args() -> Config:
     parser.add_argument("--output-dir", type=Path, default=Path("results"), help="出力先ディレクトリ")
     parser.add_argument("--batch-size", type=int, default=8, help="バッチサイズ")
     parser.add_argument("--epochs", type=int, default=10, help="学習エポック数")
-    parser.add_argument("--lr", type=float, default=1e-4, help="学習率")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="weight decay")
+    parser.add_argument("--lr", type=float, default=3e-4, help="学習率")
+    parser.add_argument("--weight-decay", type=float, default=1e-3, help="weight decay")
+    parser.add_argument("--beta1", type=float, default=0.9, help="AdamW beta1")
+    parser.add_argument("--beta2", type=float, default=0.99, help="AdamW beta2")
     parser.add_argument("--num-workers", type=int, default=4, help="DataLoaderのワーカー数")
     parser.add_argument("--img-size", type=int, default=320, help="入力画像サイズ")
     parser.add_argument(
@@ -1286,9 +1301,22 @@ def parse_args() -> Config:
     parser.add_argument(
         "--scheduler",
         type=str,
-        default="cosine",
+        default="onecycle",
         choices=["cosine", "onecycle", "none"],
         help="学習率スケジューラ",
+    )
+    parser.add_argument("--onecycle-pct-start", type=float, default=0.1, help="OneCycleの上昇割合")
+    parser.add_argument(
+        "--onecycle-div-factor",
+        type=float,
+        default=25.0,
+        help="OneCycleの初期lrスケール",
+    )
+    parser.add_argument(
+        "--onecycle-final-div-factor",
+        type=float,
+        default=1e4,
+        help="OneCycleの最終lrスケール",
     )
     parser.add_argument("--pin-memory", action="store_true", help="pin_memoryを有効化")
     parser.add_argument(
@@ -1334,6 +1362,8 @@ def parse_args() -> Config:
         epochs=args.epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        beta1=args.beta1,
+        beta2=args.beta2,
         num_workers=args.num_workers,
         img_size=args.img_size,
         device=args.device,
@@ -1360,6 +1390,9 @@ def parse_args() -> Config:
         thresholds=thresholds,
         sampler=args.sampler,
         pos_boost=args.pos_boost,
+        onecycle_pct_start=args.onecycle_pct_start,
+        onecycle_div_factor=args.onecycle_div_factor,
+        onecycle_final_div_factor=args.onecycle_final_div_factor,
     )
 
 
@@ -1453,6 +1486,8 @@ def main() -> None:
             epochs=config.epochs,
             lr=config.lr,
             weight_decay=config.weight_decay,
+            beta1=config.beta1,
+            beta2=config.beta2,
             num_workers=0,
             img_size=config.img_size,
             device=config.device,
@@ -1479,6 +1514,9 @@ def main() -> None:
             thresholds=config.thresholds,
             sampler=config.sampler,
             pos_boost=config.pos_boost,
+            onecycle_pct_start=config.onecycle_pct_start,
+            onecycle_div_factor=config.onecycle_div_factor,
+            onecycle_final_div_factor=config.onecycle_final_div_factor,
         )
 
     data_dir = resolve_data_root(config.input_dir)
@@ -1546,7 +1584,12 @@ def main() -> None:
 
     model = resolve_model(config, in_channels=num_channels).to(device)
     criterion = build_loss(config)
-    optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config.lr,
+        weight_decay=config.weight_decay,
+        betas=(config.beta1, config.beta2),
+    )
     scheduler, step_per_batch = build_scheduler(optimizer, config, steps_per_epoch=len(train_loader))
     scaler = GradScaler(enabled=config.amp)
 

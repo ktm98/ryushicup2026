@@ -12,7 +12,9 @@
 - `--output-dir`: 出力ディレクトリ（デフォルト: `results`）
 - `--epochs`: 学習エポック数
 - `--batch-size`: バッチサイズ
-- `--lr`: 学習率
+- `--lr`: 学習率（デフォルト: 3e-4）
+- `--weight-decay`: weight decay（デフォルト: 1e-3）
+- `--beta1`, `--beta2`: AdamWのbeta
 - `--num-workers`: DataLoaderのワーカー数
 - `--device`: 使用デバイス
 - `--debug`: デバッグモード（小さなデータで実行）
@@ -27,5 +29,7 @@
 - `--thresholds`: しきい値候補の明示指定
 - `--sampler`: 学習サンプラー（`weighted` など）
 - `--pos-boost`: 正例サンプルの重み強化
+- `--scheduler`: 学習率スケジューラ（デフォルト: `onecycle`）
+- `--onecycle-pct-start`, `--onecycle-div-factor`, `--onecycle-final-div-factor`: OneCycleの詳細設定
 
 `--help` で詳細を確認できます。

@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import subprocess
 import tempfile
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -38,6 +40,11 @@ class Config:
     sbert_model: str
     token_limit: int
     token_limit_percentile: int
+    num_workers: int
+    request_timeout: int
+    sbert_device: str
+    sbert_batch_size: int
+    sbert_max_length: int
 
 
 def parse_args() -> Config:
@@ -64,6 +71,11 @@ def parse_args() -> Config:
     parser.add_argument("--sbert-model", type=str, default="all-MiniLM-L6-v2")
     parser.add_argument("--token-limit", type=int, default=0)
     parser.add_argument("--token-limit-percentile", type=int, default=95)
+    parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--request-timeout", type=int, default=60)
+    parser.add_argument("--sbert-device", type=str, default="cpu")
+    parser.add_argument("--sbert-batch-size", type=int, default=8)
+    parser.add_argument("--sbert-max-length", type=int, default=0)
     args = parser.parse_args()
     return Config(
         input_dir=args.input_dir,
@@ -82,6 +94,11 @@ def parse_args() -> Config:
         sbert_model=args.sbert_model,
         token_limit=args.token_limit,
         token_limit_percentile=args.token_limit_percentile,
+        num_workers=args.num_workers,
+        request_timeout=args.request_timeout,
+        sbert_device=args.sbert_device,
+        sbert_batch_size=args.sbert_batch_size,
+        sbert_max_length=args.sbert_max_length,
     )
 
 
@@ -272,7 +289,8 @@ def build_style_prompt(
         limit_text = f" Limit to {token_limit} tokens or fewer."
     return (
         "You are given a short video. Write one English prompt in the same style as the examples. "
-        f"Focus on subject, action, setting, and motion. Use a single sentence without quotes.{limit_text}\n"
+        "Include subject, action, setting, and motion. If visible, add camera, lighting, or atmosphere. "
+        f"Use a single sentence without quotes or bullet points.{limit_text}\n"
         f"Examples:\n{examples}\nNow write the prompt for the video."
     )
 
@@ -329,26 +347,52 @@ def estimate_token_limit(prompts: List[str], percentile: int) -> int:
     return max(1, value)
 
 
-def embed_caption_sbert(caption: str, model_name: str) -> np.ndarray:
-    """SentenceTransformerで埋め込みを作る.
+def load_sbert_model(model_name: str, device: str, max_length: int):
+    """SentenceTransformerを読み込む.
 
     Args:
-        caption: キャプション.
         model_name: モデル名.
+        device: デバイス.
+        max_length: 最大長.
 
     Returns:
-        np.ndarray: 埋め込み.
+        SentenceTransformer: モデル.
 
     Raises:
-        RuntimeError: モデルのロードに失敗した場合.
+        RuntimeError: ロード失敗時.
     """
     try:
         from sentence_transformers import SentenceTransformer
     except Exception as exc:
         raise RuntimeError("sentence-transformers が見つかりません") from exc
-    model = SentenceTransformer(model_name)
-    embedding = model.encode([caption], normalize_embeddings=True)[0]
-    return np.asarray(embedding, dtype=np.float32)
+    model = SentenceTransformer(model_name, device=device)
+    if max_length > 0:
+        model.max_seq_length = max_length
+    return model
+
+
+def embed_captions_batch(
+    captions: List[str], model, batch_size: int
+) -> np.ndarray:
+    """キャプションをまとめて埋め込む.
+
+    Args:
+        captions: キャプション一覧.
+        model: SentenceTransformer.
+        batch_size: バッチサイズ.
+
+    Returns:
+        np.ndarray: 埋め込み配列.
+    """
+    if not captions:
+        return np.empty((0, 0), dtype=np.float32)
+    embeddings = model.encode(
+        captions,
+        normalize_embeddings=True,
+        batch_size=max(1, batch_size),
+        convert_to_numpy=True,
+    )
+    return np.asarray(embeddings, dtype=np.float32)
 
 
 def l2_normalize(vec: np.ndarray) -> np.ndarray:
@@ -440,6 +484,9 @@ def main() -> None:
         token_limit = estimate_token_limit(prompts, config.token_limit_percentile)
     if config.debug:
         print(f"token_limit: {token_limit} (percentile={config.token_limit_percentile})")
+    num_workers = config.num_workers
+    if num_workers <= 0:
+        num_workers = min(4, max(1, os.cpu_count() or 1))
     if config.prompt_text:
         prompt_text = config.prompt_text
     elif config.use_train_style:
@@ -456,9 +503,12 @@ def main() -> None:
         )
     test_videos = list_test_videos(config.test_movie_dir)
 
-    predictions = []
+    sbert_model = load_sbert_model(
+        config.sbert_model, config.sbert_device, config.sbert_max_length
+    )
     debug_rows = []
-    for video_path in tqdm(test_videos, desc="videos"):
+    captions = {}
+    def process_video(video_path: Path) -> dict:
         start_time = time.time()
         if ffmpeg_missing:
             frames = [dummy_image_data_url()]
@@ -469,23 +519,52 @@ def main() -> None:
             config.model,
             prompt_text,
             frames,
+            timeout_sec=config.request_timeout,
         )
-        caption = truncate_tokens(caption, token_limit)
-        pred = embed_caption_sbert(caption, config.sbert_model)
-        pred = l2_normalize(pred)
-        predictions.append(pred)
-        if config.debug:
-            debug_rows.append(
-                {
-                    "video_id": int(video_path.stem),
-                    "caption": caption,
-                    "elapsed_sec": round(time.time() - start_time, 3),
-                }
-            )
-            print(f"{video_path.name}: {caption}")
+        return {
+            "video_id": int(video_path.stem),
+            "caption": caption,
+            "elapsed_sec": round(time.time() - start_time, 3),
+        }
 
-    video_ids = [int(p.stem) for p in test_videos]
-    save_submission(config.output_path, video_ids, np.array(predictions))
+    if num_workers == 1:
+        for video_path in tqdm(test_videos, desc="videos"):
+            result = process_video(video_path)
+            caption = truncate_tokens(result["caption"], token_limit)
+            captions[result["video_id"]] = caption
+            if config.debug:
+                debug_rows.append(
+                    {
+                        "video_id": result["video_id"],
+                        "caption": caption,
+                        "elapsed_sec": result["elapsed_sec"],
+                    }
+                )
+                print(f'{result["video_id"]}.mp4: {caption}')
+    else:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_video, vp): vp for vp in test_videos}
+            for future in tqdm(as_completed(futures), total=len(futures), desc="videos"):
+                result = future.result()
+                caption = truncate_tokens(result["caption"], token_limit)
+                captions[result["video_id"]] = caption
+                if config.debug:
+                    debug_rows.append(
+                        {
+                            "video_id": result["video_id"],
+                            "caption": caption,
+                            "elapsed_sec": result["elapsed_sec"],
+                        }
+                    )
+                    tqdm.write(f'{result["video_id"]}.mp4: {caption}')
+
+    video_ids = sorted(captions.keys())
+    caption_list = [captions[vid] for vid in video_ids]
+    embeddings = embed_captions_batch(
+        caption_list, sbert_model, config.sbert_batch_size
+    )
+    embeddings = np.vstack([l2_normalize(vec) for vec in embeddings])
+    save_submission(config.output_path, video_ids, embeddings)
 
     if config.debug and debug_rows:
         debug_path = config.output_path.parent / "debug.csv"

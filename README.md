@@ -10,6 +10,7 @@ ryushicup2026 baseline
 - ffmpeg/ffprobe が PATH にあること
 - vLLM サーバーが localhost で起動していること
 - SentenceTransformer を使う場合は初回にモデルがダウンロードされます
+- vLLM への同時リクエスト数は --num-workers で調整できます（OOM対策で既定は1）
 
 モックサーバー起動
 ```
@@ -27,6 +28,9 @@ python src/baseline.py \
   --max-frames 8 \
   --use-train-style \
   --token-limit-percentile 95 \
+  --num-workers 1 \
+  --sbert-device cpu \
+  --sbert-batch-size 8 \
   --debug
 ```
 

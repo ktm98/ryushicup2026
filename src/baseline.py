@@ -289,9 +289,10 @@ def build_style_prompt(
         limit_text = f" Limit to {token_limit} tokens or fewer."
     return (
         "You are given a short video. Write one English prompt in the same style as the examples. "
-        "Include subject, action, setting, and motion. If visible, add camera, lighting, or atmosphere. "
-        f"Use a single sentence without quotes or bullet points.{limit_text}\n"
-        f"Examples:\n{examples}\nNow write the prompt for the video."
+        "Include main subject(s), action, setting, and motion. If visible, add camera framing, lens, "
+        "camera movement, lighting, atmosphere, and texture/material. Mention temporal behavior (e.g., "
+        "looping, drifting, repeating, continuous) when applicable. Use a single sentence without quotes, "
+        f"tags, or bullet points.{limit_text}\nExamples:\n{examples}\nNow write the prompt for the video."
     )
 
 

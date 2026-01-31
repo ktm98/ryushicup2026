@@ -227,10 +227,10 @@ def get_transforms(train: bool, img_size: int, num_channels: int) -> Optional[ob
             A.HorizontalFlip(p=0.5),
             A.VerticalFlip(p=0.5),
             A.RandomRotate90(p=0.5),
-            A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.1, rotate_limit=15, p=0.5),
+            A.Affine(translate_percent=0.1, scale=(0.9, 1.1), rotate=(-15, 15), p=0.5),
             A.OneOf(
                 [
-                    A.ElasticTransform(alpha=50, sigma=6, alpha_affine=3, p=1.0),
+                    A.ElasticTransform(alpha=50, sigma=6, p=1.0),
                     A.GridDistortion(p=1.0),
                 ],
                 p=0.3,
@@ -524,6 +524,25 @@ def build_normalization_stats(num_channels: int) -> Tuple[List[float], List[floa
     return mean, std
 
 
+def normalize_encoder_name(encoder: str) -> str:
+    """エンコーダ名を正規化する。
+
+    Args:
+        encoder: 入力エンコーダ名。
+
+    Returns:
+        正規化後のエンコーダ名。
+    """
+
+    convnext_aliases = {
+        "convnext_tiny": "timm-convnext_tiny",
+        "convnext_small": "timm-convnext_small",
+        "convnext_base": "timm-convnext_base",
+        "convnext_large": "timm-convnext_large",
+    }
+    return convnext_aliases.get(encoder, encoder)
+
+
 def compute_sample_weights(
     image_ids: List[str],
     label_dir: Path,
@@ -648,6 +667,7 @@ def resolve_model(config: Config, in_channels: int) -> nn.Module:
         raise ImportError("segmentation_models_pytorch が見つかりません")
 
     arch = config.arch.lower()
+    encoder_name = normalize_encoder_name(config.encoder)
     if arch == "unet":
         model_cls = smp.Unet
     elif arch == "unetplusplus":
@@ -665,7 +685,7 @@ def resolve_model(config: Config, in_channels: int) -> nn.Module:
 
     try:
         model = model_cls(
-            encoder_name=config.encoder,
+            encoder_name=encoder_name,
             encoder_weights=config.encoder_weights,
             in_channels=in_channels,
             classes=1,
@@ -976,7 +996,7 @@ def parse_args() -> Config:
         choices=["unet", "unetplusplus", "efficientunetplusplus", "deeplabv3plus", "fpn"],
         help="アーキテクチャ",
     )
-    parser.add_argument("--encoder", type=str, default="convnext_tiny", help="エンコーダ名")
+    parser.add_argument("--encoder", type=str, default="timm-convnext_tiny", help="エンコーダ名")
     parser.add_argument(
         "--encoder-weights",
         type=str,

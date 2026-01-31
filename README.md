@@ -17,7 +17,7 @@
 - `--device`: 使用デバイス
 - `--debug`: デバッグモード（小さなデータで実行）
 - `--arch`: アーキテクチャ（`unetplusplus` など）
-- `--encoder`: エンコーダ名（`resnet34` など）
+- `--encoder`: エンコーダ名（デフォルト: `timm-convnext_tiny`）
 - `--loss`: 損失関数（`dice_bce` など）
 - `--tta`: 推論時TTA
 - `--min-area`: 小さい予測マスクの除外
